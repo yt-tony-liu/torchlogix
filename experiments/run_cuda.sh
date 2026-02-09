@@ -6,7 +6,6 @@ python train.py \
     --dataset cifar-10-5-thresholds \
     --architecture DlgnCifar10Large \
     --parametrization raw \
-    --implementation python \
     --device cuda \
     --batch-size 64 \
     --eval-freq 500 \
@@ -20,7 +19,6 @@ python train.py \
     --dataset cifar-10-5-thresholds \
     --architecture DlgnCifar10Large \
     --parametrization raw \
-    --implementation python \
     --device cuda \
     --batch-size 64 \
     --eval-freq 500 \
@@ -39,7 +37,6 @@ python train.py \
     --dataset cifar-10-3-thresholds \
     --architecture ClgnCifar10SmallRes \
     --parametrization raw \
-    --implementation python \
     --device cuda \
     --batch-size 64 \
     --eval-freq 500 \
@@ -53,7 +50,6 @@ python train.py \
     --dataset cifar-10-3-thresholds \
     --architecture ClgnCifar10SmallRes \
     --parametrization raw \
-    --implementation python \
     --device cuda \
     --batch-size 64 \
     --eval-freq 500 \
@@ -67,7 +63,6 @@ python train.py \
     --dataset cifar-10-3-thresholds \
     --architecture ClgnCifar10SmallRes \
     --parametrization walsh \
-    --implementation python \
     --device cuda \
     --batch-size 64 \
     --eval-freq 500 \
@@ -81,7 +76,6 @@ python train.py \
     --dataset cifar-10-3-thresholds \
     --architecture ClgnCifar10SmallRes \
     --parametrization walsh \
-    --implementation python \
     --device cuda \
     --batch-size 64 \
     --eval-freq 500 \

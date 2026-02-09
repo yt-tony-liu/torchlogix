@@ -165,7 +165,8 @@ def run_training(args):
     eval_functions = create_eval_functions(loss_fn)
 
     # Training tracking
-    metrics = defaultdict(list)
+    # metrics = defaultdict(list)
+    metrics = defaultdict(dict)
     best_val_acc = 0.0
 
     print(f"Starting training for {args.num_iterations} iterations...")

@@ -22,6 +22,14 @@ from ..functional import (
 from ..packbitstensor import PackBitsTensor
 
 
+try:
+    import torchlogix_cuda
+except ImportError:
+    warnings.warn(
+        "failed to import torchlogix_cuda. no cuda features will be available",
+        ImportWarning,
+    )
+
 ##########################################################################
 
 class LogicDense(torch.nn.Module):

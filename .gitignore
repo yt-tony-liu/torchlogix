@@ -20,3 +20,8 @@ docs/.doctrees/
 # data in experiments folder
 experiments/data-mnist/
 experiments/data-fmnist/
+experiments/data-cifar/
+data-mnist/
+results/
+*.tar.gz
+*.pt

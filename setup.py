@@ -3,13 +3,16 @@
 import os
 
 from setuptools import find_packages, setup
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 
-
-ext_modules = []
+ext_modules = [CUDAExtension('torchlogix_cuda', [
+    'src/torchlogix/cuda/torchlogix.cpp',
+    'src/torchlogix/cuda/torchlogix_kernel.cu',
+], extra_compile_args={'nvcc': ['-lineinfo']})]
 
 
 setup(
