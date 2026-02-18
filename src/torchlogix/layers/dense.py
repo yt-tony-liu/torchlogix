@@ -116,6 +116,11 @@ class LogicDense(torch.nn.Module):
             self.implementation = "python"
         assert self.implementation in ["cuda", "python"], self.implementation
 
+        # CUDA dense kernel only supports 'raw' parametrization (16-gate blend);
+        # fall back to Python for 'walsh'/'anf' (4-coefficient basis)
+        if self.implementation == "cuda" and self.parametrization != "raw":
+            self.implementation = "python"
+
         self.connections = connections
         assert self.connections in ["random", "unique"], self.connections
         self.indices = self.get_connections(self.connections, device)

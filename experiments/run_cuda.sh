@@ -62,7 +62,7 @@ python train.py \
 python train.py \
     --dataset cifar-10-3-thresholds \
     --architecture ClgnCifar10SmallRes \
-    --parametrization walsh \
+    --parametrization raw \
     --device cuda \
     --batch-size 64 \
     --eval-freq 500 \
@@ -71,6 +71,19 @@ python train.py \
     --forward-sampling gumbel_soft \
     --weight-init random \
     --output results/clgn-ours-random/
+
+# python train.py \
+#     --dataset cifar-10-3-thresholds \
+#     --architecture ClgnCifar10SmallRes \
+#     --parametrization walsh \
+#     --device cuda \
+#     --batch-size 64 \
+#     --eval-freq 500 \
+#     --num-iterations 50_000 \
+#     --seed 0 \
+#     --forward-sampling gumbel_soft \
+#     --weight-init random \
+#     --output results/clgn-ours-random/
 
 python train.py \
     --dataset cifar-10-3-thresholds \

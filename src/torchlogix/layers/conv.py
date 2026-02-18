@@ -9,6 +9,18 @@ from torch.nn.functional import gumbel_softmax
 
 from ..functional import bin_op_cnn, bin_op_cnn_walsh, gumbel_sigmoid, soft_raw, soft_walsh, hard_raw, hard_walsh, WALSH_COEFFICIENTS
 
+import warnings
+
+try:
+    import torchlogix_cuda
+except ImportError:
+    warnings.warn(
+        "failed to import torchlogix_cuda. CUDA features will not be available for conv layers.",
+        ImportWarning,
+    )
+
+from .dense import LogicDenseCudaFunction
+
 
 class LogicConv2d(nn.Module):
     """2d convolutional layer with differentiable logic operations.
@@ -109,9 +121,22 @@ class LogicConv2d(nn.Module):
         self.indices = self.get_indices_from_kernel_pairs(self.kernel_pairs)
         self.temperature = temperature
 
+        # Determine implementation
+        self.implementation = implementation
+        if self.implementation is None:
+            if device == "cuda":
+                self.implementation = "cuda"
+            else:
+                self.implementation = "python"
+
+        if self.implementation == "cuda":
+            self._prepare_cuda_indices()
+
 
     def forward(self, x):
         """Implement the binary tree using the pre-selected indices."""
+        if self.implementation == "cuda":
+            return self.forward_cuda(x)
         current_level = x
         if self.padding > 0:
             current_level = torch.nn.functional.pad(
@@ -353,6 +378,267 @@ class LogicConv2d(nn.Module):
             right_indices = torch.arange(1, size, 2, device=self.device)
             indices.append((left_indices, right_indices))
         return indices
+
+    # ------------------------------------------------------------------ #
+    #  CUDA acceleration (Approach A: flatten-and-reuse dense kernel)     #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _build_reverse_map(flat_a, flat_b, in_dim):
+        """Build CSR-like reverse mapping: for each input index, which output neurons use it.
+
+        This is required by the dense CUDA backward_x kernel.
+        Returns (given_x_indices_of_y_start, given_x_indices_of_y).
+        """
+        given_x_indices_of_y = [[] for _ in range(in_dim)]
+        a_np = flat_a.cpu().numpy()
+        b_np = flat_b.cpu().numpy()
+        out_dim = len(a_np)
+        for y in range(out_dim):
+            given_x_indices_of_y[int(a_np[y])].append(y)
+            given_x_indices_of_y[int(b_np[y])].append(y)
+        device = flat_a.device
+        rev_start = torch.tensor(
+            np.array([0] + [len(g) for g in given_x_indices_of_y]).cumsum(),
+            device=device, dtype=torch.int64,
+        )
+        rev_map = torch.tensor(
+            [item for sublist in given_x_indices_of_y for item in sublist],
+            dtype=torch.int64, device=device,
+        )
+        return rev_start, rev_map
+
+    def _prepare_cuda_indices(self):
+        """Precompute flat 1-D indices and reverse maps for every tree level.
+
+        Level 0 flattens the multi-dimensional sliding-window indices into
+        linear offsets into a ``(C*H_p*W_p, batch)`` tensor so the existing
+        dense CUDA kernel can be re-used.  Levels 1+ pair consecutive
+        elements in the sample dimension.
+        """
+        H_p = self.in_dim[0] + 2 * self.padding
+        W_p = self.in_dim[1] + 2 * self.padding
+
+        self._cuda_level_data = []
+
+        # --- Level 0: sliding-window indices → flat 1-D ---------------
+        left_indices, right_indices = self.indices[0]
+        # shape: (K, S, D, 3)  where 3 = (h, w, c)
+        K, S, D = left_indices.shape[0], left_indices.shape[1], left_indices.shape[2]
+
+        flat_a = (
+            left_indices[..., 2] * H_p * W_p
+            + left_indices[..., 0] * W_p
+            + left_indices[..., 1]
+        ).reshape(-1).to(torch.int64).contiguous()
+
+        flat_b = (
+            right_indices[..., 2] * H_p * W_p
+            + right_indices[..., 0] * W_p
+            + right_indices[..., 1]
+        ).reshape(-1).to(torch.int64).contiguous()
+
+        in_dim_flat = self.channels * H_p * W_p
+        rev_start, rev_map = self._build_reverse_map(flat_a, flat_b, in_dim_flat)
+
+        self._cuda_level_data.append(dict(
+            a=flat_a, b=flat_b,
+            rev_start=rev_start, rev_map=rev_map,
+            K=K, S=S, D=D,
+        ))
+
+        # --- Levels 1+ : pair-wise tree reduction ---------------------
+        D_prev = D
+        for level in range(1, self.tree_depth + 1):
+            D_new = D_prev // 2
+
+            k_idx = torch.arange(K, device=self.device)
+            s_idx = torch.arange(S, device=self.device)
+            d_idx = torch.arange(D_new, device=self.device)
+            kg, sg, dg = torch.meshgrid(k_idx, s_idx, d_idx, indexing="ij")
+
+            flat_a = (kg * S * D_prev + sg * D_prev + 2 * dg).reshape(-1).to(torch.int64).contiguous()
+            flat_b = (kg * S * D_prev + sg * D_prev + 2 * dg + 1).reshape(-1).to(torch.int64).contiguous()
+
+            in_dim_flat = K * S * D_prev
+            rev_start, rev_map = self._build_reverse_map(flat_a, flat_b, in_dim_flat)
+
+            self._cuda_level_data.append(dict(
+                a=flat_a, b=flat_b,
+                rev_start=rev_start, rev_map=rev_map,
+                K=K, S=S, D=D_new,
+            ))
+            D_prev = D_new
+
+    def _get_weighting_func(self):
+        """Return the weight-transformation function for the current forward_sampling mode."""
+        return {
+            "soft": soft_raw,
+            "hard": hard_raw,
+            "gumbel_soft": lambda w: gumbel_softmax(w, tau=self.temperature, hard=False),
+            "gumbel_hard": lambda w: gumbel_softmax(w, tau=self.temperature, hard=True),
+        }[self.forward_sampling]
+
+    def forward_cuda(self, x):
+        """CUDA-accelerated forward pass.
+
+        Flattens the 4-D input and the multi-dimensional sliding-window
+        indices into the 2-D layout expected by the dense CUDA kernel,
+        replicates shared weights across spatial positions, and chains
+        one kernel launch per tree level.
+
+        For ``parametrization='raw'`` the native CUDA kernel is used.
+        For ``parametrization='walsh'`` the flat index structure is reused
+        with standard PyTorch ops (still runs on GPU).
+        """
+        assert x.device.type == "cuda", f"CUDA forward requires a CUDA tensor, got {x.device}"
+        assert x.ndim == 4, f"Expected 4-D input (batch, C, H, W), got {x.ndim}-D"
+        batch = x.shape[0]
+
+        # Pad input if needed
+        if self.padding > 0:
+            x = torch.nn.functional.pad(
+                x,
+                (self.padding, self.padding, self.padding, self.padding),
+                mode="constant",
+                value=0,
+            )
+
+        # Flatten 4-D → 2-D  (C*H_p*W_p, batch)
+        x_flat = x.reshape(batch, -1).transpose(0, 1).contiguous()
+
+        if self.parametrization == "raw":
+            return self._forward_cuda_raw(x_flat, batch)
+        elif self.parametrization == "walsh":
+            return self._forward_cuda_walsh(x_flat, batch)
+        else:
+            raise ValueError(f"Unknown parametrization: {self.parametrization}")
+
+    def _forward_cuda_raw(self, x_flat, batch):
+        """CUDA forward path for the 'raw' (16-gate softmax) parametrization.
+
+        Uses the native ``LogicDenseCudaFunction`` kernel.
+        """
+        weighting_func = self._get_weighting_func()
+
+        current_level = None
+        for level_idx in range(self.tree_depth + 1):
+            ld = self._cuda_level_data[level_idx]
+            K, S, D = ld["K"], ld["S"], ld["D"]
+
+            # --- prepare input ----------------------------------------
+            if level_idx == 0:
+                x_in = x_flat
+            else:
+                x_in = current_level.reshape(batch, -1).transpose(0, 1).contiguous()
+
+            # --- prepare weights (shared across spatial positions) -----
+            if self.training:
+                stacked_w = torch.stack(
+                    [weighting_func(w) for w in self.tree_weights[level_idx]]
+                )  # (D, K, 16)
+            else:
+                stacked_w = torch.stack([
+                    torch.nn.functional.one_hot(w.argmax(-1), 16).to(torch.float32)
+                    for w in self.tree_weights[level_idx]
+                ])  # (D, K, 16)
+
+            # Expand: (D, K, 16) → (K, S, D, 16) → (K*S*D, 16)
+            w_flat = (
+                stacked_w
+                .permute(1, 0, 2)
+                .unsqueeze(1)
+                .expand(-1, S, -1, -1)
+                .reshape(-1, 16)
+                .to(x_in.dtype)
+            )
+
+            # --- CUDA kernel launch -----------------------------------
+            if self.training:
+                y_flat = LogicDenseCudaFunction.apply(
+                    x_in, ld["a"], ld["b"], w_flat,
+                    ld["rev_start"], ld["rev_map"],
+                )
+            else:
+                with torch.no_grad():
+                    y_flat = LogicDenseCudaFunction.apply(
+                        x_in, ld["a"], ld["b"], w_flat,
+                        ld["rev_start"], ld["rev_map"],
+                    )
+
+            current_level = y_flat.transpose(0, 1).reshape(batch, K, S, D)
+
+        # Final reshape: (batch, K, S, 1) → (batch, K, H_out, W_out)
+        reshape_h = (self.in_dim[0] + 2 * self.padding - self.receptive_field_size) // self.stride + 1
+        reshape_w = (self.in_dim[1] + 2 * self.padding - self.receptive_field_size) // self.stride + 1
+        return current_level.squeeze(-1).view(batch, K, reshape_h, reshape_w)
+
+    def _forward_cuda_walsh(self, x_flat, batch):
+        """CUDA forward path for the 'walsh' parametrization.
+
+        Uses the precomputed flat indices for efficient 1-D gather, then
+        applies the Walsh basis expansion and activation via PyTorch ops
+        (running on the CUDA device).
+        """
+        current_level = None
+        for level_idx in range(self.tree_depth + 1):
+            ld = self._cuda_level_data[level_idx]
+            K, S, D = ld["K"], ld["S"], ld["D"]
+
+            # --- prepare input ----------------------------------------
+            if level_idx == 0:
+                x_in = x_flat  # (in_flat, batch)
+            else:
+                x_in = current_level.reshape(batch, -1).transpose(0, 1).contiguous()
+
+            # --- gather via flat 1-D indices --------------------------
+            a = x_in[ld["a"]]  # (K*S*D, batch)
+            b = x_in[ld["b"]]  # (K*S*D, batch)
+
+            # --- Walsh basis: {0,1} → {-1,+1} ------------------------
+            A = 2 * a - 1
+            B = 2 * b - 1
+            basis = torch.stack([torch.ones_like(A), A, B, A * B], dim=-1)  # (K*S*D, batch, 4)
+
+            # --- weights: (D_nodes, K, 4) → (K*S*D, 1, 4) ------------
+            stacked_w = torch.stack(
+                [w for w in self.tree_weights[level_idx]]
+            )  # (D_nodes, K, 4)
+            w_expanded = (
+                stacked_w
+                .permute(1, 0, 2)       # (K, D_nodes, 4)
+                .unsqueeze(1)           # (K, 1, D_nodes, 4)
+                .expand(-1, S, -1, -1)  # (K, S, D_nodes, 4)
+                .reshape(-1, 1, 4)      # (K*S*D, 1, 4)
+            )
+
+            # --- dot product: (K*S*D, batch, 4) · (K*S*D, 1, 4) → sum → (K*S*D, batch)
+            logits = (basis * w_expanded).sum(dim=-1)  # (K*S*D, batch)
+
+            # --- activation -------------------------------------------
+            if self.training:
+                if level_idx == 0:
+                    # Level 0: use the user-selected sampling strategy
+                    if self.forward_sampling == "soft":
+                        output = soft_walsh(logits, tau=self.temperature)
+                    elif self.forward_sampling == "hard":
+                        output = hard_walsh(logits, tau=self.temperature)
+                    elif self.forward_sampling == "gumbel_soft":
+                        output = gumbel_sigmoid(logits, tau=self.temperature, hard=False)
+                    elif self.forward_sampling == "gumbel_hard":
+                        output = gumbel_sigmoid(logits, tau=self.temperature, hard=True)
+                else:
+                    # Tree reduction levels: plain sigmoid (matches Python path)
+                    output = torch.sigmoid(logits / self.temperature)
+            else:
+                output = (logits > 0).to(torch.float32)
+
+            current_level = output.transpose(0, 1).reshape(batch, K, S, D)
+
+        # Final reshape: (batch, K, S, 1) → (batch, K, H_out, W_out)
+        reshape_h = (self.in_dim[0] + 2 * self.padding - self.receptive_field_size) // self.stride + 1
+        reshape_w = (self.in_dim[1] + 2 * self.padding - self.receptive_field_size) // self.stride + 1
+        return current_level.squeeze(-1).view(batch, K, reshape_h, reshape_w)
 
 
 class LogicConv3d(nn.Module):
