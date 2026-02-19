@@ -168,17 +168,10 @@ def bin_op_cnn_walsh(a, b, i_s):
     A = 2 * a - 1  # Convert to {-1, 1}
     B = 2 * b - 1  # Convert to {-1, 1}
 
-    r = torch.stack([
-        torch.ones_like(A),  # 0: 1
-        A,                   # 1: A
-        B,                   # 2: B
-        A * B                # 3: A and B in Walsh basis
-    ], dim=-1)
-
-    i_s = i_s.unsqueeze(0).unsqueeze(2)
-    i_s = i_s.expand(r.shape[0], -1, r.shape[2], -1, -1)
-    i_s = i_s.permute(0, 3, 2, 1, 4)
-    return (r * i_s).sum(dim=-1)
+    # i_s: (D_nodes, K, 4), a/b: (batch, K, spatial, D_nodes)
+    # Direct FMA avoids torch.stack + intermediate basis tensor
+    w = i_s.permute(1, 0, 2).unsqueeze(0).unsqueeze(2)  # (1, K, 1, D, 4)
+    return w[..., 0] + w[..., 1] * A + w[..., 2] * B + w[..., 3] * (A * B)
 
 
 ##########################################################################
@@ -341,4 +334,115 @@ def hard_walsh(logits, tau=1.0):
     x = torch.sigmoid(logits / tau)
     x = (x > 0.5).to(torch.float32) - x.detach() + x
     return x
+
+
+##########################################################################
+# Compiled fused Walsh forward functions
+#
+# Fuse Walsh basis computation (direct FMA, no torch.stack) with the
+# activation into a single compiled graph so the Inductor backend can
+# lower everything to one or two Triton kernels instead of 10+ separate
+# CUDA launches.
+##########################################################################
+
+# ---- Dense layer variants (weight shape: (out_dim, 4)) ---------------
+
+@torch.compile
+def walsh_fused_soft_dense(a, b, weight, tau):
+    """Fused Walsh logit + sigmoid for dense layers (training, soft)."""
+    A = 2.0 * a - 1.0
+    B = 2.0 * b - 1.0
+    logits = weight[..., 0] + weight[..., 1] * A + weight[..., 2] * B + weight[..., 3] * (A * B)
+    return torch.sigmoid(logits / tau)
+
+@torch.compile
+def walsh_fused_hard_dense(a, b, weight, tau):
+    """Fused Walsh logit + hard sigmoid for dense layers (training, hard)."""
+    A = 2.0 * a - 1.0
+    B = 2.0 * b - 1.0
+    logits = weight[..., 0] + weight[..., 1] * A + weight[..., 2] * B + weight[..., 3] * (A * B)
+    x = torch.sigmoid(logits / tau)
+    x_hard = (x > 0.5).to(torch.float32)
+    return x_hard - x.detach() + x
+
+@torch.compile
+def walsh_fused_gumbel_soft_dense(a, b, weight, tau):
+    """Fused Walsh logit + gumbel sigmoid (soft) for dense layers."""
+    A = 2.0 * a - 1.0
+    B = 2.0 * b - 1.0
+    logits = weight[..., 0] + weight[..., 1] * A + weight[..., 2] * B + weight[..., 3] * (A * B)
+    U = torch.rand_like(logits)
+    logistic_noise = torch.log(U + 1e-20) - torch.log(1.0 - U + 1e-20)
+    return torch.sigmoid((logits + logistic_noise) / tau)
+
+@torch.compile
+def walsh_fused_gumbel_hard_dense(a, b, weight, tau):
+    """Fused Walsh logit + gumbel sigmoid (hard) for dense layers."""
+    A = 2.0 * a - 1.0
+    B = 2.0 * b - 1.0
+    logits = weight[..., 0] + weight[..., 1] * A + weight[..., 2] * B + weight[..., 3] * (A * B)
+    U = torch.rand_like(logits)
+    logistic_noise = torch.log(U + 1e-20) - torch.log(1.0 - U + 1e-20)
+    y_soft = torch.sigmoid((logits + logistic_noise) / tau)
+    y_hard = (y_soft > 0.5).to(torch.float32)
+    return y_hard - y_soft.detach() + y_soft
+
+@torch.compile
+def walsh_fused_eval_dense(a, b, weight):
+    """Fused Walsh logit + threshold for eval mode in dense layers."""
+    A = 2.0 * a - 1.0
+    B = 2.0 * b - 1.0
+    logits = weight[..., 0] + weight[..., 1] * A + weight[..., 2] * B + weight[..., 3] * (A * B)
+    return (logits > 0).to(torch.float32)
+
+
+# ---- Conv layer variants (weight shape: (K*S*D, 4)) ------------------
+
+@torch.compile
+def walsh_fused_sigmoid_conv(a, b, w, tau):
+    """Fused Walsh logit + sigmoid for conv layers (soft / tree reduction)."""
+    A = 2.0 * a - 1.0
+    B = 2.0 * b - 1.0
+    logits = w[:, 0:1] + w[:, 1:2] * A + w[:, 2:3] * B + w[:, 3:4] * (A * B)
+    return torch.sigmoid(logits / tau)
+
+@torch.compile
+def walsh_fused_hard_conv(a, b, w, tau):
+    """Fused Walsh logit + hard sigmoid for conv layers (hard)."""
+    A = 2.0 * a - 1.0
+    B = 2.0 * b - 1.0
+    logits = w[:, 0:1] + w[:, 1:2] * A + w[:, 2:3] * B + w[:, 3:4] * (A * B)
+    x = torch.sigmoid(logits / tau)
+    x_hard = (x > 0.5).to(torch.float32)
+    return x_hard - x.detach() + x
+
+@torch.compile
+def walsh_fused_gumbel_soft_conv(a, b, w, tau):
+    """Fused Walsh logit + gumbel sigmoid (soft) for conv layers."""
+    A = 2.0 * a - 1.0
+    B = 2.0 * b - 1.0
+    logits = w[:, 0:1] + w[:, 1:2] * A + w[:, 2:3] * B + w[:, 3:4] * (A * B)
+    U = torch.rand_like(logits)
+    logistic_noise = torch.log(U + 1e-20) - torch.log(1.0 - U + 1e-20)
+    return torch.sigmoid((logits + logistic_noise) / tau)
+
+@torch.compile
+def walsh_fused_gumbel_hard_conv(a, b, w, tau):
+    """Fused Walsh logit + gumbel sigmoid (hard) for conv layers."""
+    A = 2.0 * a - 1.0
+    B = 2.0 * b - 1.0
+    logits = w[:, 0:1] + w[:, 1:2] * A + w[:, 2:3] * B + w[:, 3:4] * (A * B)
+    U = torch.rand_like(logits)
+    logistic_noise = torch.log(U + 1e-20) - torch.log(1.0 - U + 1e-20)
+    y_soft = torch.sigmoid((logits + logistic_noise) / tau)
+    y_hard = (y_soft > 0.5).to(torch.float32)
+    return y_hard - y_soft.detach() + y_soft
+
+@torch.compile
+def walsh_fused_eval_conv(a, b, w):
+    """Fused Walsh logit + threshold for conv eval mode."""
+    A = 2.0 * a - 1.0
+    B = 2.0 * b - 1.0
+    logits = w[:, 0:1] + w[:, 1:2] * A + w[:, 2:3] * B + w[:, 3:4] * (A * B)
+    return (logits > 0).to(torch.float32)
 

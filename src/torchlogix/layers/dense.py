@@ -18,6 +18,11 @@ from ..functional import (
     hard_raw,
     hard_walsh,
     WALSH_COEFFICIENTS,
+    walsh_fused_soft_dense,
+    walsh_fused_hard_dense,
+    walsh_fused_gumbel_soft_dense,
+    walsh_fused_gumbel_hard_dense,
+    walsh_fused_eval_dense,
 )
 from ..packbitstensor import PackBitsTensor
 
@@ -195,26 +200,17 @@ class LogicDense(torch.nn.Module):
                 )
                 x = bin_op_s(a, b, weights)
         elif self.parametrization == "walsh":
-            A = 2 * a -1
-            B = 2 * b -1
-            basis = torch.stack([
-                torch.ones_like(A),
-                A,
-                B,
-                A*B
-            ], dim=-1)
-            x = (self.weight * basis).sum(dim=-1)
             if self.training:
                 if self.forward_sampling == "soft":
-                    x = soft_walsh(x, tau=self.temperature)
+                    x = walsh_fused_soft_dense(a, b, self.weight, self.temperature)
                 elif self.forward_sampling == "hard":
-                    x = hard_walsh(x, tau=self.temperature)
+                    x = walsh_fused_hard_dense(a, b, self.weight, self.temperature)
                 elif self.forward_sampling == "gumbel_soft":
-                    x = gumbel_sigmoid(x, tau=self.temperature, hard=False)
+                    x = walsh_fused_gumbel_soft_dense(a, b, self.weight, self.temperature)
                 elif self.forward_sampling == "gumbel_hard":
-                    x = gumbel_sigmoid(x, tau=self.temperature, hard=True)
+                    x = walsh_fused_gumbel_hard_dense(a, b, self.weight, self.temperature)
             else:
-                x = (x > 0).to(torch.float32)
+                x = walsh_fused_eval_dense(a, b, self.weight)
         return x
 
     def forward_cuda(self, x):

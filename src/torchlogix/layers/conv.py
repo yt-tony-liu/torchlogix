@@ -7,7 +7,13 @@ from torch.nn.common_types import _size_2_t, _size_3_t
 from torch.nn.modules.utils import _pair, _triple
 from torch.nn.functional import gumbel_softmax
 
-from ..functional import bin_op_cnn, bin_op_cnn_walsh, gumbel_sigmoid, soft_raw, soft_walsh, hard_raw, hard_walsh, WALSH_COEFFICIENTS
+from ..functional import (
+    bin_op_cnn, bin_op_cnn_walsh, gumbel_sigmoid,
+    soft_raw, soft_walsh, hard_raw, hard_walsh, WALSH_COEFFICIENTS,
+    walsh_fused_sigmoid_conv, walsh_fused_hard_conv,
+    walsh_fused_gumbel_soft_conv, walsh_fused_gumbel_hard_conv,
+    walsh_fused_eval_conv,
+)
 
 import warnings
 
@@ -577,8 +583,8 @@ class LogicConv2d(nn.Module):
         """CUDA forward path for the 'walsh' parametrization.
 
         Uses the precomputed flat indices for efficient 1-D gather, then
-        applies the Walsh basis expansion and activation via PyTorch ops
-        (running on the CUDA device).
+        applies the Walsh basis expansion and activation via compiled fused
+        Triton kernels (running on the CUDA device).
         """
         current_level = None
         for level_idx in range(self.tree_depth + 1):
@@ -595,43 +601,33 @@ class LogicConv2d(nn.Module):
             a = x_in[ld["a"]]  # (K*S*D, batch)
             b = x_in[ld["b"]]  # (K*S*D, batch)
 
-            # --- Walsh basis: {0,1} → {-1,+1} ------------------------
-            A = 2 * a - 1
-            B = 2 * b - 1
-            basis = torch.stack([torch.ones_like(A), A, B, A * B], dim=-1)  # (K*S*D, batch, 4)
-
-            # --- weights: (D_nodes, K, 4) → (K*S*D, 1, 4) ------------
+            # --- weights: (D_nodes, K, 4) → (K*S*D, 4) ---------------
             stacked_w = torch.stack(
                 [w for w in self.tree_weights[level_idx]]
             )  # (D_nodes, K, 4)
-            w_expanded = (
+            w_flat = (
                 stacked_w
                 .permute(1, 0, 2)       # (K, D_nodes, 4)
                 .unsqueeze(1)           # (K, 1, D_nodes, 4)
                 .expand(-1, S, -1, -1)  # (K, S, D_nodes, 4)
-                .reshape(-1, 1, 4)      # (K*S*D, 1, 4)
+                .reshape(-1, 4)          # (K*S*D, 4)
             )
 
-            # --- dot product: (K*S*D, batch, 4) · (K*S*D, 1, 4) → sum → (K*S*D, batch)
-            logits = (basis * w_expanded).sum(dim=-1)  # (K*S*D, batch)
-
-            # --- activation -------------------------------------------
+            # --- fused Walsh basis + activation (compiled) ------------
             if self.training:
                 if level_idx == 0:
-                    # Level 0: use the user-selected sampling strategy
                     if self.forward_sampling == "soft":
-                        output = soft_walsh(logits, tau=self.temperature)
+                        output = walsh_fused_sigmoid_conv(a, b, w_flat, self.temperature)
                     elif self.forward_sampling == "hard":
-                        output = hard_walsh(logits, tau=self.temperature)
+                        output = walsh_fused_hard_conv(a, b, w_flat, self.temperature)
                     elif self.forward_sampling == "gumbel_soft":
-                        output = gumbel_sigmoid(logits, tau=self.temperature, hard=False)
+                        output = walsh_fused_gumbel_soft_conv(a, b, w_flat, self.temperature)
                     elif self.forward_sampling == "gumbel_hard":
-                        output = gumbel_sigmoid(logits, tau=self.temperature, hard=True)
+                        output = walsh_fused_gumbel_hard_conv(a, b, w_flat, self.temperature)
                 else:
-                    # Tree reduction levels: plain sigmoid (matches Python path)
-                    output = torch.sigmoid(logits / self.temperature)
+                    output = walsh_fused_sigmoid_conv(a, b, w_flat, self.temperature)
             else:
-                output = (logits > 0).to(torch.float32)
+                output = walsh_fused_eval_conv(a, b, w_flat)
 
             current_level = output.transpose(0, 1).reshape(batch, K, S, D)
 
