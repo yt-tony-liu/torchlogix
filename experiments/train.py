@@ -3,6 +3,7 @@
 
 import argparse
 import random
+import sys
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
@@ -11,11 +12,18 @@ import hist
 import torch
 from tqdm import tqdm
 
+# Ensure experiment scripts import local source tree first (src-layout project).
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
 from utils import (
     DATASET_CHOICES, ARCHITECTURE_CHOICES, BITS_TO_TORCH_FLOATING_POINT_TYPE,
     IMPL_TO_DEVICE, setup_experiment, CreateFolder, save_metrics_csv, save_config,
     create_eval_functions, evaluate_model, train, get_model, load_dataset, load_n
 )
+from utils.adaptive_discretization import AdaptiveDiscretizer
 
 import torchlogix
 
@@ -146,6 +154,33 @@ def analyze_nodes_closest_to_half(model, input_data, top_n=5):
         hook.remove()
 
 
+def rebuild_optimizer_with_trainable_params(model, args, old_optimizer):
+    """Rebuild optimizer using only params that still require gradients."""
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        print("[AD] Warning: no trainable parameters remain; keeping existing optimizer.")
+        return old_optimizer
+
+    optimizer_cls = type(old_optimizer)
+    defaults = dict(old_optimizer.defaults)
+    try:
+        new_optimizer = optimizer_cls(trainable_params, **defaults)
+        if old_optimizer.state:
+            print("[AD] Rebuilt optimizer with trainable parameters; optimizer state was reset.")
+        return new_optimizer
+    except Exception as exc:
+        print(
+            f"[AD] Warning: failed to rebuild {optimizer_cls.__name__} with preserved defaults ({exc}). "
+            "Falling back to AdamW."
+        )
+        effective_lr = args.learning_rate * getattr(args, "output_gate_factor", 1.0)
+        return torch.optim.AdamW(
+            trainable_params,
+            lr=effective_lr,
+            weight_decay=getattr(args, "weight_decay", 0.002),
+        )
+
+
 def run_training(args):
     """Run the training loop."""
     # Setup experiment
@@ -163,6 +198,18 @@ def run_training(args):
 
     # Create evaluation functions
     eval_functions = create_eval_functions(loss_fn)
+    discretizer = None
+    if args.adaptive_discretization:
+        discretizer = AdaptiveDiscretizer(
+            model=model,
+            check_interval=args.ad_check_interval,
+            warmup_steps=args.ad_warmup_steps,
+            ema_beta=args.ad_ema_beta,
+            entropy_threshold=args.ad_entropy_threshold,
+            delta_threshold=args.ad_delta_threshold,
+            target="conv",
+        )
+        print(f"[AD] Enabled adaptive discretization for {len(discretizer.layer_states)} conv layers.")
 
     # Training tracking
     # metrics = defaultdict(list)
@@ -184,7 +231,7 @@ def run_training(args):
         y = y.to(args.device)
 
         # Training step
-        loss = train(model, x, y, loss_fn, optim)#, reg_lambda=args.reg_lambda)
+        loss = train(model, x, y, loss_fn, optim, reg_lambda=args.reg_lambda)
         pbar.set_postfix(loss=f"{loss:.4f}")
 
         if args.temp_decay is not None:
@@ -193,6 +240,13 @@ def run_training(args):
                 if isinstance(layer, torchlogix.layers.LogicConv2d) or isinstance(layer, torchlogix.layers.LogicDense):
                     layer.temperature = temperature
             pbar.set_postfix(loss=f"{loss:.4f}", temp=f"{temperature:.4f}")
+
+        global_step = i + 1
+        if discretizer is not None:
+            event = discretizer.maybe_discretize(global_step)
+            if event is not None:
+                print(event)
+                optim = rebuild_optimizer_with_trainable_params(model, args, optim)
 
         # Evaluation
         if ((i + 1) % args.eval_freq == 0) or (i == 0):
@@ -308,11 +362,11 @@ def main():
     # Training parameters
     parser.add_argument("--seed", "-s", type=int, default=42, help="Random seed")
     parser.add_argument("--batch-size", "-bs", type=int, default=128, help="Batch size")
-    parser.add_argument("--learning-rate", "-lr", type=float, default=0.01, help="Learning rate")
+    parser.add_argument("--learning-rate", "-lr", type=float, default=0.02, help="Learning rate")
     parser.add_argument("--temp-decay", "-td", type=float, default=None,
                          help="Temperature decay, e.g. 4 (only applicable to walsh-parametrized models)")
     parser.add_argument(
-        "--num-iterations", "-ni", type=int, default=100_000, help="Number of training iterations"
+        "--num-iterations", "-ni", type=int, default=30_000, help="Number of training iterations"
     )
     parser.add_argument(
         "--eval-freq", "-ef", type=int, default=2_000, help="Evaluation frequency"
@@ -360,6 +414,16 @@ def main():
         "--weight-growth", type=float, default=0.0,
         help="Weight growth factor per iteration"
     )
+
+    parser.add_argument(
+        "--weight-decay", "-wd", type=float, default=0.002,
+        help="Weight decay for AdamW optimizer (paper: 0.002 for small, 0.001 for large models)"
+    )
+
+    parser.add_argument(
+        "--output-gate-factor", "-ogf", type=float, default=1.0,
+        help="Output gate scaling factor applied to learning rate (paper: B/L models use 2.0)"
+    )
     
     parser.add_argument(
         "--forward-sampling", type=str, default="soft", choices=["soft", "hard", "gumbel_soft", "gumbel_hard"],
@@ -369,6 +433,30 @@ def main():
     parser.add_argument(
         "--weight-init", type=str, default="residual", choices=["residual", "random"],
         help="Initialization method for model weights"
+    )
+    parser.add_argument(
+        "--adaptive-discretization", action="store_true",
+        help="Enable layer-wise adaptive discretization for conv layers."
+    )
+    parser.add_argument(
+        "--ad-check-interval", type=int, default=200,
+        help="Steps between adaptive discretization checks."
+    )
+    parser.add_argument(
+        "--ad-warmup-steps", type=int, default=2000,
+        help="Warmup steps before allowing any layer discretization."
+    )
+    parser.add_argument(
+        "--ad-ema-beta", type=float, default=0.95,
+        help="EMA beta for layer selection entropy tracking."
+    )
+    parser.add_argument(
+        "--ad-entropy-threshold", type=float, default=0.20,
+        help="Convergence entropy threshold for discretization."
+    )
+    parser.add_argument(
+        "--ad-delta-threshold", type=float, default=1e-3,
+        help="Convergence threshold on EMA change magnitude."
     )
 
     args = parser.parse_args()

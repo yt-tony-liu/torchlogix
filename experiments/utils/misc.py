@@ -138,10 +138,35 @@ def load_model_from_checkpoint(model_path: Path, model_class, **model_kwargs):
     return model
 
 
-def train(model, x, y, loss_fn, optimizer):
+def _gate_entropy_reg(model):
+    """Compute mean entropy over 16-gate logits for raw-parametrized layers.
+
+    H(p) = -sum(p * log(p)) encourages the soft gate distribution to
+    commit to a single gate rather than spreading probability mass
+    uniformly, which would stall learning around 50% accuracy.
+    """
+    entropy = 0.0
+    count = 0
+    for module in model.modules():
+        if getattr(module, 'parametrization', None) != 'raw':
+            continue
+        for param in module.parameters(recurse=False):
+            if param.dim() >= 1 and param.shape[-1] == 16:
+                p = torch.softmax(param, dim=-1)
+                entropy += -(p * torch.log(p + 1e-8)).sum(-1).mean()
+                count += 1
+    return entropy / max(count, 1)
+
+
+def train(model, x, y, loss_fn, optimizer, reg_lambda=0.0):
     model.train()
     x = model(x)
     loss = loss_fn(x, y)
+
+    # Entropy regularization: penalise ambiguous gate distributions
+    if reg_lambda > 0.0:
+        loss = loss + reg_lambda * _gate_entropy_reg(model)
+
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()

@@ -13,6 +13,9 @@ from .shared_config import (
     IMPL_TO_DEVICE, setup_experiment
 )
 from .drawing import plot_loss_histories
+from .adaptive_discretization import (
+    EntropyEMA, LayerDiscretizationState, AdaptiveDiscretizer
+)
 
 
 __all__ = [
@@ -31,4 +34,6 @@ __all__ = [
     "IMPL_TO_DEVICE", "setup_experiment",
     # plotting
     "plot_loss_curves",
+    # adaptive discretization
+    "EntropyEMA", "LayerDiscretizationState", "AdaptiveDiscretizer",
 ]

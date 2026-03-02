@@ -1,4 +1,4 @@
-from typing import Union
+from typing import List, Optional, Union
 import math
 import numpy as np
 import torch
@@ -126,6 +126,8 @@ class LogicConv2d(nn.Module):
             raise ValueError(f"Unknown connections type: {connections}")
         self.indices = self.get_indices_from_kernel_pairs(self.kernel_pairs)
         self.temperature = temperature
+        self._force_discrete = False
+        self._discrete_tree_weights: Optional[List[List[torch.Tensor]]] = None
 
         # Determine implementation
         self.implementation = implementation
@@ -138,6 +140,67 @@ class LogicConv2d(nn.Module):
         if self.implementation == "cuda":
             self._prepare_cuda_indices()
 
+    def _build_discrete_raw_tree_weights(self) -> List[List[torch.Tensor]]:
+        """Cache one-hot gate selections used by the forced-discrete mode."""
+        discrete_tree_weights: List[List[torch.Tensor]] = []
+        for level_weights in self.tree_weights:
+            level_discrete = []
+            for weight in level_weights:
+                level_discrete.append(
+                    torch.nn.functional.one_hot(weight.argmax(-1), 16).to(torch.float32)
+                )
+            discrete_tree_weights.append(level_discrete)
+        return discrete_tree_weights
+
+    def _get_discrete_raw_level_weights(
+        self,
+        level_idx: int,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        if self._discrete_tree_weights is None:
+            self._discrete_tree_weights = self._build_discrete_raw_tree_weights()
+        level_weights = torch.stack(self._discrete_tree_weights[level_idx], dim=0)
+        if device is not None and dtype is not None:
+            level_weights = level_weights.to(device=device, dtype=dtype)
+        elif device is not None:
+            level_weights = level_weights.to(device=device)
+        elif dtype is not None:
+            level_weights = level_weights.to(dtype=dtype)
+        return level_weights
+
+    def get_selection_entropy(self) -> torch.Tensor:
+        """Return mean entropy over gate-selection logits for this layer."""
+        entropies = []
+        tau = getattr(self, "temperature", None)
+        temp = max(float(tau), 1e-8) if tau is not None else None
+
+        for level_weights in self.tree_weights:
+            for logits in level_weights:
+                scaled_logits = logits / temp if temp is not None else logits
+                probs = torch.softmax(scaled_logits, dim=-1)
+                entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
+                entropies.append(entropy)
+
+        if entropies:
+            return torch.stack(entropies).mean()
+
+        device = next(self.parameters()).device
+        return torch.tensor(0.0, device=device)
+
+    def discretize_inplace(self) -> None:
+        """Switch layer forward pass to deterministic discrete mode."""
+        if self.parametrization == "raw":
+            self._discrete_tree_weights = self._build_discrete_raw_tree_weights()
+        self._force_discrete = True
+
+    def freeze_discrete_params(self) -> None:
+        """Freeze parameters controlling gate selection."""
+        for param in self.tree_weights.parameters():
+            param.requires_grad = False
+
+    def is_discretized(self) -> bool:
+        return self._force_discrete
 
     def forward(self, x):
         """Implement the binary tree using the pre-selected indices."""
@@ -159,20 +222,19 @@ class LogicConv2d(nn.Module):
         b = current_level[:, b_c, b_h, b_w]
 
         if self.parametrization == "raw":
-            weighting_func = {
-                "soft": soft_raw,
-                "hard": hard_raw,
-                "gumbel_soft": lambda w: gumbel_softmax(w, tau=self.temperature, hard=False),
-                "gumbel_hard": lambda w: gumbel_softmax(w, tau=self.temperature, hard=True),
-            }[self.forward_sampling]
-
-            level_weights = torch.stack(
-                [weighting_func(w) for w in self.tree_weights[0]], dim=0
-            )
-            if not self.training:
-                level_weights = torch.nn.functional.one_hot(level_weights.argmax(-1), 16).to(
-                    torch.float32
+            weighting_func = self._get_weighting_func()
+            if self._force_discrete:
+                level_weights = self._get_discrete_raw_level_weights(
+                    0, dtype=torch.float32, device=a.device
                 )
+            else:
+                level_weights = torch.stack(
+                    [weighting_func(w) for w in self.tree_weights[0]], dim=0
+                )
+                if not self.training:
+                    level_weights = torch.nn.functional.one_hot(level_weights.argmax(-1), 16).to(
+                        torch.float32
+                    )
 
             current_level = bin_op_cnn(a, b, level_weights)
 
@@ -181,20 +243,27 @@ class LogicConv2d(nn.Module):
                 left_indices, right_indices = self.indices[level]
                 a = current_level[..., left_indices]
                 b = current_level[..., right_indices]
-                level_weights = torch.stack(
-                    [weighting_func(w) for w in self.tree_weights[level]], dim=0
-                )
-                if not self.training:
-                    level_weights = torch.nn.functional.one_hot(level_weights.argmax(-1), 16).to(
-                        torch.float32
+                if self._force_discrete:
+                    level_weights = self._get_discrete_raw_level_weights(
+                        level, dtype=torch.float32, device=a.device
                     )
+                else:
+                    level_weights = torch.stack(
+                        [weighting_func(w) for w in self.tree_weights[level]], dim=0
+                    )
+                    if not self.training:
+                        level_weights = torch.nn.functional.one_hot(level_weights.argmax(-1), 16).to(
+                            torch.float32
+                        )
 
                 current_level = bin_op_cnn(a, b, level_weights)
 
         elif self.parametrization == "walsh":
             level_weights = torch.stack([w for w in self.tree_weights[0]], dim=0)
             current_level = bin_op_cnn_walsh(a, b, level_weights)
-            if self.training:
+            if self._force_discrete:
+                current_level = (current_level > 0).to(torch.float32)
+            elif self.training:
                 if self.forward_sampling == "soft":
                     current_level = soft_walsh(current_level, tau=self.temperature)
                 elif self.forward_sampling == "hard":
@@ -214,7 +283,9 @@ class LogicConv2d(nn.Module):
                 # level_weights = self.tree_weights[level]
                 level_weights = torch.stack([w for w in self.tree_weights[level]], dim=0)
                 current_level = bin_op_cnn_walsh(a, b, level_weights)
-                if self.training:
+                if self._force_discrete:
+                    current_level = (current_level > 0).to(torch.float32)
+                elif self.training:
                     current_level = torch.sigmoid(current_level / self.temperature)
                 else:
                     current_level = (current_level > 0).to(torch.float32)
@@ -245,10 +316,19 @@ class LogicConv2d(nn.Module):
 
         # Generate different random pairs for each kernel
         for _ in range(self.num_kernels):
+            # Pick exactly 2 distinct input channels for this kernel's tree.
+            # This concentrates each tree's leaf nodes on a channel pair,
+            # which maps efficiently to FPGA routing fabric.
+            if c >= 2:
+                ch_pair = torch.randperm(c, device=self.device)[:2]
+            else:
+                ch_pair = torch.zeros(2, dtype=torch.long, device=self.device)
+
             # Randomly select positions within the receptive field
             h_indices = torch.randint(0, h_k, (2 * sample_size,), device=self.device)
             w_indices = torch.randint(0, w_k, (2 * sample_size,), device=self.device)
-            c_indices = torch.randint(0, c, (2 * sample_size,), device=self.device)
+            # Restrict channel indices to the selected pair
+            c_indices = ch_pair[torch.randint(0, len(ch_pair), (2 * sample_size,), device=self.device)]
 
             # Stack the indices
             indices = torch.stack([h_indices, w_indices, c_indices], dim=-1)
@@ -539,7 +619,11 @@ class LogicConv2d(nn.Module):
                 x_in = current_level.reshape(batch, -1).transpose(0, 1).contiguous()
 
             # --- prepare weights (shared across spatial positions) -----
-            if self.training:
+            if self._force_discrete:
+                stacked_w = self._get_discrete_raw_level_weights(
+                    level_idx, dtype=torch.float32, device=x_in.device
+                )
+            elif self.training:
                 stacked_w = torch.stack(
                     [weighting_func(w) for w in self.tree_weights[level_idx]]
                 )  # (D, K, 16)
@@ -614,7 +698,9 @@ class LogicConv2d(nn.Module):
             )
 
             # --- fused Walsh basis + activation (compiled) ------------
-            if self.training:
+            if self._force_discrete:
+                output = walsh_fused_eval_conv(a, b, w_flat)
+            elif self.training:
                 if level_idx == 0:
                     if self.forward_sampling == "soft":
                         output = walsh_fused_sigmoid_conv(a, b, w_flat, self.temperature)

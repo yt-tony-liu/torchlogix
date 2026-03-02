@@ -27,6 +27,13 @@ def get_model(args):
 
     loss_fn = torch.nn.CrossEntropyLoss()
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    # Scale learning rate by output_gate_factor when set (paper: B/L models use factor 2)
+    effective_lr = args.learning_rate * getattr(args, "output_gate_factor", 1.0)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=effective_lr,
+        weight_decay=getattr(args, "weight_decay", 0.002),
+    )
 
     return model, loss_fn, optimizer
