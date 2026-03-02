@@ -9,6 +9,7 @@ python train.py \
     --seed 0 \
     --forward-sampling soft \
     --weight-init residual \
+    --adaptive-discretization \
     --output results/clgnS_raw_soft/
 
 python train.py \
@@ -22,6 +23,7 @@ python train.py \
     --seed 0 \
     --forward-sampling soft \
     --weight-init residual \
+    --adaptive-discretization \
     --output results/clgnM_raw_soft/
 
 python train.py \
@@ -35,4 +37,5 @@ python train.py \
     --seed 0 \
     --forward-sampling soft \
     --weight-init residual \
+    --adaptive-discretization \
     --output results/clgnL_raw_soft/
